@@ -33,7 +33,6 @@ class TrajectoryGeneration:
         return [x, y]
     
     def find_cfn(self) -> float:
-        # I am so sorry future me
         
         p1 = self.calculate_p1(self.b)
         
