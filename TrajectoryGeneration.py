@@ -6,9 +6,9 @@ class TrajectoryGeneration:
     
     def __init__(self, p0, p2, b): # where p0 is robot starting pose, p2 is ending pose, and b distance vertex of parabola is from midpoint of the line between p0 and p2
         
-        self.p0
-        self.p2
-        self.b
+        self.p0 = p0
+        self.p2 = p2
+        self.b = b
         
 
     def calculateMidpoint (self) -> list[float]: # where index 0 is x and 1 is y. We will just denote this as p3
@@ -28,7 +28,7 @@ class TrajectoryGeneration:
         
         
         m = -((self.p2[0] - self.p0[0]) / (self.p2[1] - self.p0[1]))
-        y = m(x - p3[0]) + p3[1]
+        y = m * (x - p3[0]) + p3[1]
         
         return [x, y]
     
@@ -47,9 +47,11 @@ class TrajectoryGeneration:
         
         
         
-        cfn_numerator = (-(p0y - p1y)(dx)) + ((p0x - p1x)(dy) ((math.pow(dy, 2)) + (math.pow(dx, 2)))) 
+        cfn_numerator = (-(p0y - p1y) * (dx)) + ((p0x - p1x) * (dy) * ((math.pow(dy, 2)) + (math.pow(dx, 2)))) 
         
-        cfn_denominator = (math.sqrt(math.pow(dy, 2) + math.pow(dx, 2)))*(math.pow((((-1((p0x - p1x))(dx)) - (p0y - p1y)(dy))), 2)) # check around line 65 in graph to figure out what this is
+        # check around line 65 in graph to figure out what this is
+        cfn_denominator = (math.sqrt(math.pow(dy, 2) + math.pow(dx, 2)))*(math.pow((((-1 * ((p0x - p1x)) * (dx)) - (p0y - p1y) * (dy))), 2)) 
+        
         
         return cfn_numerator / cfn_denominator
         
@@ -81,7 +83,7 @@ class TrajectoryGeneration:
         
         cfn = self.find_cfn()
         
-        Y = (L ((-dy * t) + (-1 * (cfn * math.pow(t, 2)) * dx)) / (math.pow(dy, 2) + math.pow(dx, 2))) + p1[1]  # check line about 136
+        Y = (L * ((-dy * t) + (-1 * (cfn * math.pow(t, 2)) * dx)) / (math.pow(dy, 2) + math.pow(dx, 2))) + p1[1]  # check line about 136
         
         return Y
     
@@ -145,7 +147,13 @@ class TrajectoryGeneration:
         
         
         
-    def lengthAlongTheCurveArray(self, lowerBound=bounds()[0], upperBound=bounds()[1], steps=10000) -> list[float]:
+    def lengthAlongTheCurveArray(self, steps=10000) -> list[float]:
+        
+        bounds = self.bounds()
+        lowerBound = bounds[0]
+        upperBound = bounds[1]
+        
+        
         step_size = (upperBound - lowerBound) / steps
         total_length = []
 

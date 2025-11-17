@@ -1,0 +1,18 @@
+{
+  "motionProfile": {
+    "vi": 0.0,
+    "vf": 2.0,
+    "accel_t": 1.0,
+    "deccel_t": 1.0,
+    "noccel_t": 0.0
+  },
+  "steps": 100,
+  "defaultCurveIntensity": 5.05,
+  "segments": [
+    {
+      "start": { "x": 1.7, "y": 2.3, "heading": 0.0 },
+      "end":   { "x": 5.8, "y": 6.7, "heading": 90.0 },
+      "curveIntensity": 5.05
+    }
+  ]
+}
