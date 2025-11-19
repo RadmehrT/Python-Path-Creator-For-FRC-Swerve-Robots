@@ -41,22 +41,23 @@ class pathCreator:
         p0_vec = [P0.getX(), P0.getY()]
         p2_vec = [P2.getX(), P2.getY()]
 
-        T = self.findT(p0_vec, p2_vec, curveIntensity)
-        if T is None or not np.isfinite(T) or T <= 0:
+        trajectorygenerator = TrajectoryGeneration(p0_vec, p2_vec, curveIntensity)
+
+        try:
+            lower_t, upper_t = trajectorygenerator.bounds()
+        except ZeroDivisionError:
             return []
 
-        upper_t = T
-        lower_t = -T
+        if not (np.isfinite(lower_t) and np.isfinite(upper_t)) or upper_t == lower_t:
+            return []
 
         poses: list[Pose2D] = []
 
         if steps <= 1:
-            t_values = [upper_t]
+            t_values = [lower_t]
         else:
             dt = (upper_t - lower_t) / (steps - 1)
-            t_values = [upper_t - i * dt for i in range(steps)]
-
-        trajectorygenerator = TrajectoryGeneration(p0_vec, p2_vec, curveIntensity)
+            t_values = [lower_t + i * dt for i in range(steps)]
 
         start_heading = P0.getHeading()
         end_heading = P2.getHeading()

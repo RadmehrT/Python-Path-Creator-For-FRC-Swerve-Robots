@@ -195,6 +195,240 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
     return {"trajectories": trajectories}, section_times
 
 
+def _compute_distance_time_profile(
+    trajectories: list[dict], section_times: list[float]
+) -> tuple[list[float], list[float], list[float]]:
+    """
+    Build distance- and speed-vs-time profiles using the
+    sampled poses on each segment and the per-segment durations.
+    """
+    if not trajectories or not section_times:
+        return [], [], []
+
+    n_segments = min(len(trajectories), len(section_times))
+
+    times: list[float] = []
+    distances: list[float] = []
+
+    t_global = 0.0
+    s_global = 0.0
+
+    for seg_idx in range(n_segments):
+        traj = trajectories[seg_idx]
+        poses = traj.get("poses", [])
+        if not poses:
+            t_global += float(section_times[seg_idx])
+            continue
+
+        # Per-segment arc length built from sampled poses
+        seg_distances = [0.0]
+        seg_len = 0.0
+        for i in range(1, len(poses)):
+            x0, y0 = poses[i - 1]["x"], poses[i - 1]["y"]
+            x1, y1 = poses[i]["x"], poses[i]["y"]
+            ds = math.hypot(x1 - x0, y1 - y0)
+            seg_len += ds
+            seg_distances.append(seg_len)
+
+        T = float(section_times[seg_idx])
+        if seg_len <= 0.0 or T <= 0.0:
+            for _ in seg_distances:
+                times.append(t_global)
+                distances.append(s_global)
+        else:
+            for local_s in seg_distances:
+                frac = local_s / seg_len
+                times.append(t_global + frac * T)
+                distances.append(s_global + local_s)
+
+        t_global += T
+        s_global += seg_len
+
+    if not times:
+        return [], [], []
+
+    speeds: list[float] = [0.0]
+    for i in range(1, len(times)):
+        dt = times[i] - times[i - 1]
+        ds = distances[i] - distances[i - 1]
+        if dt <= 1e-6:
+            speeds.append(speeds[-1])
+        else:
+            speeds.append(ds / dt)
+
+    return times, distances, speeds
+
+
+def create_visualization_pdf(
+    trajectories: list[dict], section_times: list[float], pdf_path: str
+) -> None:
+    """
+    Create a PDF containing:
+      - one XY plot per trajectory segment,
+      - a combined XY plot showing all segments and waypoints,
+      - a distance-over-time plot with speed overlay.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+    except ImportError:
+        print("matplotlib is not installed; skipping PDF visualization.")
+        return
+
+    if not trajectories:
+        print("No trajectories to visualize.")
+        return
+
+    with PdfPages(pdf_path) as pdf:
+        # Individual segment plots: "Trajectory 1, 2, ..."
+        for idx, traj in enumerate(trajectories, start=1):
+            poses = traj.get("poses", [])
+            if not poses:
+                continue
+
+            xs = [p["x"] for p in poses]
+            ys = [p["y"] for p in poses]
+
+            fig, ax = plt.subplots()
+            ax.plot(xs, ys, marker="o", markersize=2)
+            ax.set_title(f"Trajectory {idx}: point {idx - 1} to point {idx}")
+            ax.set_xlabel("X")
+            ax.set_ylabel("Y")
+            ax.grid(True)
+            ax.axis("equal")
+
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        # Combined XY plot of all trajectories, stitched end-to-start
+        fig, ax = plt.subplots()
+
+        # Waypoints derived directly from segment start/end (CSV rows)
+        waypoints: list[dict] = []
+        if trajectories:
+            waypoints.append(trajectories[0]["start"])
+            for traj in trajectories:
+                waypoints.append(traj["end"])
+
+        # Plot each segment curve, but transform its local geometry so that
+        # the first and last poses land exactly on the corresponding
+        # waypoint coordinates. This keeps the CSV waypoints authoritative.
+        for idx, traj in enumerate(trajectories):
+            poses = traj.get("poses", [])
+            if not poses:
+                continue
+
+            if not waypoints or idx + 1 >= len(waypoints):
+                continue
+
+            start_wp = waypoints[idx]
+            end_wp = waypoints[idx + 1]
+
+            raw_xs = [p["x"] for p in poses]
+            raw_ys = [p["y"] for p in poses]
+
+            # Local endpoints from the generated curve
+            p0x, p0y = raw_xs[0], raw_ys[0]
+            p1x, p1y = raw_xs[-1], raw_ys[-1]
+
+            v_local_x = p1x - p0x
+            v_local_y = p1y - p0y
+            v_local_len = math.hypot(v_local_x, v_local_y)
+
+            w_global_x = end_wp["x"] - start_wp["x"]
+            w_global_y = end_wp["y"] - start_wp["y"]
+            w_global_len = math.hypot(w_global_x, w_global_y)
+
+            if v_local_len < 1e-6 or w_global_len < 1e-6:
+                # Degenerate segment; just draw a straight line between waypoints.
+                ax.plot(
+                    [start_wp["x"], end_wp["x"]],
+                    [start_wp["y"], end_wp["y"]],
+                    linewidth=1.5,
+                    label=f"Segment {idx + 1}",
+                )
+                continue
+
+            # Uniform scale so arc length matches the waypoint chord length
+            scale = w_global_len / v_local_len
+
+            # Unit vectors
+            ux_local = v_local_x / v_local_len
+            uy_local = v_local_y / v_local_len
+            ux_global = w_global_x / w_global_len
+            uy_global = w_global_y / w_global_len
+
+            # Rotation that maps local direction to global direction
+            cos_theta = ux_local * ux_global + uy_local * uy_global
+            # Clamp for safety
+            cos_theta = max(-1.0, min(1.0, cos_theta))
+            sin_theta = ux_local * uy_global - uy_local * ux_global
+
+            def _transform_point(x: float, y: float) -> tuple[float, float]:
+                # Shift so p0 is at the origin
+                lx = x - p0x
+                ly = y - p0y
+
+                # Scale
+                lx *= scale
+                ly *= scale
+
+                # Rotate
+                rx = cos_theta * lx - sin_theta * ly
+                ry = sin_theta * lx + cos_theta * ly
+
+                # Translate to the global start waypoint
+                gx = start_wp["x"] + rx
+                gy = start_wp["y"] + ry
+                return gx, gy
+
+            xs, ys = zip(*(_transform_point(x, y) for x, y in zip(raw_xs, raw_ys)))
+            ax.plot(xs, ys, linewidth=1.5, label=f"Segment {idx + 1}")
+
+        # Plot the CSV waypoints themselves, in order, as authoritative points.
+        if waypoints:
+            wx = [p["x"] for p in waypoints]
+            wy = [p["y"] for p in waypoints]
+            ax.plot(wx, wy, "ro", markersize=4, label="Waypoints")
+
+            for i, p in enumerate(waypoints):
+                ax.annotate(
+                    str(i),
+                    (p["x"], p["y"]),
+                    textcoords="offset points",
+                    xytext=(5, 5),
+                    fontsize=8,
+                )
+
+        ax.set_title("All Trajectories Combined (stitched to CSV waypoints)")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.grid(True)
+        ax.axis("equal")
+
+        pdf.savefig(fig)
+        plt.close(fig)
+
+        # Distance and speed versus time
+        times, distances, speeds = _compute_distance_time_profile(trajectories, section_times)
+        if times and distances:
+            fig, ax1 = plt.subplots()
+            ax1.plot(times, distances, color="tab:blue", label="Distance")
+            ax1.set_xlabel("Time (s)")
+            ax1.set_ylabel("Distance (m)", color="tab:blue")
+            ax1.tick_params(axis="y", labelcolor="tab:blue")
+            ax1.grid(True)
+
+            ax2 = ax1.twinx()
+            ax2.plot(times, speeds, color="tab:orange", label="Speed")
+            ax2.set_ylabel("Speed (m/s)", color="tab:orange")
+            ax2.tick_params(axis="y", labelcolor="tab:orange")
+
+            fig.suptitle("Distance and Speed vs Time")
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate trajectories from a CSV of waypoints."
@@ -210,6 +444,13 @@ def main() -> None:
         nargs="?",
         default="my_output.json",
         help="Output JSON file for generated trajectories.",
+    )
+    parser.add_argument(
+        "--pdf",
+        nargs="?",
+        const="trajectories.pdf",
+        default="trajectories.pdf",
+        help="Output PDF file for trajectory visualizations.",
     )
 
     parser.add_argument("--vi", type=float, default=0.0, help="Initial velocity.")
@@ -260,8 +501,59 @@ def main() -> None:
         total_time_all += t
     print(f"total time: {total_time_all}")
 
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+    # 1) Preserve the original output format as myoutput_spliced.json
+    with open("myoutput_spliced.json", "w", encoding="utf-8") as f_spliced:
+        json.dump(result, f_spliced, indent=2)
+
+    # 2) Build the new flattened-per-trajectory format for my_output.json
+    trajectories = result.get("trajectories", [])
+    flattened: dict[str, list[dict]] = {}
+    for idx, traj in enumerate(trajectories, start=1):
+        name = f"traj_{idx}"
+        points: list[dict] = []
+
+        start_data = traj.get("start")
+        end_data = traj.get("end")
+        poses = traj.get("poses", [])
+
+        # First entry: explicit start coordinate
+        if start_data is not None:
+            points.append(
+                {
+                    "x": start_data["x"],
+                    "y": start_data["y"],
+                    "heading": start_data.get("heading", 0.0),
+                }
+            )
+
+        # All sampled poses along the path
+        for p in poses:
+            points.append(
+                {
+                    "x": p["x"],
+                    "y": p["y"],
+                    "heading": p.get("heading", 0.0),
+                }
+            )
+
+        # Last entry: explicit end coordinate
+        if end_data is not None:
+            points.append(
+                {
+                    "x": end_data["x"],
+                    "y": end_data["y"],
+                    "heading": end_data.get("heading", 0.0),
+                }
+            )
+
+        flattened[name] = points
+
+    with open(args.output, "w", encoding="utf-8") as f_flat:
+        json.dump(flattened, f_flat, indent=2)
+
+    if trajectories:
+        create_visualization_pdf(trajectories, section_times, args.pdf)
+        print(f"Saved trajectory visualizations to {args.pdf}")
 
 
 if __name__ == "__main__":
