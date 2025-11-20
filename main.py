@@ -327,6 +327,15 @@ def create_visualization_pdf(
             raw_xs = [p["x"] for p in poses]
             raw_ys = [p["y"] for p in poses]
 
+            # Ensure the sampled curve runs from start->end; reverse if it is backward.
+            local_dx = raw_xs[-1] - raw_xs[0]
+            local_dy = raw_ys[-1] - raw_ys[0]
+            global_dx = end_wp["x"] - start_wp["x"]
+            global_dy = end_wp["y"] - start_wp["y"]
+            if local_dx * global_dx + local_dy * global_dy < 0:
+                raw_xs = list(reversed(raw_xs))
+                raw_ys = list(reversed(raw_ys))
+
             # Local endpoints from the generated curve
             p0x, p0y = raw_xs[0], raw_ys[0]
             p1x, p1y = raw_xs[-1], raw_ys[-1]
@@ -389,15 +398,42 @@ def create_visualization_pdf(
         if waypoints:
             wx = [p["x"] for p in waypoints]
             wy = [p["y"] for p in waypoints]
-            ax.plot(wx, wy, "ro", markersize=4, label="Waypoints")
+            ax.plot(wx, wy, "o", color="red", markersize=5, label="Waypoints")
+
+            highlight_indices = set(range(len(waypoints)))
+            if highlight_indices:
+                hx = [p["x"] for i, p in enumerate(waypoints) if i in highlight_indices]
+                hy = [p["y"] for i, p in enumerate(waypoints) if i in highlight_indices]
+                ax.scatter(
+                    hx,
+                    hy,
+                    s=80,
+                    facecolors="yellow",
+                    edgecolors="black",
+                    linewidths=1.5,
+                    zorder=5,
+                    label="Waypoints (highlighted)",
+                )
 
             for i, p in enumerate(waypoints):
+                annotate_style: dict = {
+                    "fontsize": 10,
+                    "fontweight": "bold",
+                    "color": "black",
+                    "bbox": {
+                        "boxstyle": "round,pad=0.2",
+                        "fc": "white",
+                        "ec": "black",
+                        "lw": 0.5,
+                    },
+                }
+
                 ax.annotate(
                     str(i),
                     (p["x"], p["y"]),
                     textcoords="offset points",
                     xytext=(5, 5),
-                    fontsize=8,
+                    **annotate_style,
                 )
 
         ax.set_title("All Trajectories Combined (stitched to CSV waypoints)")
@@ -405,8 +441,14 @@ def create_visualization_pdf(
         ax.set_ylabel("Y")
         ax.grid(True)
         ax.axis("equal")
+        ax.legend(
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            borderaxespad=1,
+            fontsize=9,
+        )
 
-        pdf.savefig(fig)
+        pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
         # Distance and speed versus time
