@@ -51,8 +51,6 @@ class pathCreator:
         if not (np.isfinite(lower_t) and np.isfinite(upper_t)) or upper_t == lower_t:
             return []
 
-        poses: list[Pose2D] = []
-
         if steps <= 1:
             t_values = [lower_t]
         else:
@@ -62,20 +60,33 @@ class pathCreator:
         start_heading = P0.getHeading()
         end_heading = P2.getHeading()
 
-        for idx, t in enumerate(t_values):
+        coords: list[tuple[float, float]] = []
+        for t in t_values:
             x = trajectorygenerator.X_ParametricFunction(t)
             y = trajectorygenerator.Y_ParametricFunction(t)
+            coords.append((x, y))
 
-            if steps <= 1:
-                progress = 0.0
-            else:
-                progress = idx / (steps - 1)
+        # Distance-based heading interpolation: finish rotation by 75% of path length
+        dists: list[float] = [0.0]
+        total_len = 0.0
+        for i in range(1, len(coords)):
+            x0, y0 = coords[i - 1]
+            x1, y1 = coords[i]
+            ds = float(np.hypot(x1 - x0, y1 - y0))
+            total_len += ds
+            dists.append(total_len)
 
-            if progress <= 0.75:
-                ratio = progress / 0.75 if 0.75 > 0 else 0.0
-                heading = start_heading + ratio * (end_heading - start_heading)
-            else:
+        poses: list[Pose2D] = []
+        for idx, (x, y) in enumerate(coords):
+            if total_len <= 0.0:
                 heading = end_heading
+            else:
+                frac_s = dists[idx] / total_len
+                if frac_s <= 0.75:
+                    ratio = frac_s / 0.75 if 0.75 > 0 else 0.0
+                    heading = start_heading + ratio * (end_heading - start_heading)
+                else:
+                    heading = end_heading
 
             poses.append(Pose2D(x, y, heading))
 

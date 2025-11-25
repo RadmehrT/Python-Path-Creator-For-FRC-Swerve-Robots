@@ -3,58 +3,12 @@ import json
 from pathlib import Path
 
 from generate_input_from_csv import build_config_from_csv
-from main import generate_trajectories_from_config, create_visualization_pdf
-
-
-def _flatten_trajectories(result: dict) -> dict:
-    """
-    Build the traj_n-style flattened output structure from the
-    result produced by generate_trajectories_from_config.
-    """
-    trajectories = result.get("trajectories", [])
-    flattened: dict[str, list[dict]] = {}
-
-    for idx, traj in enumerate(trajectories, start=1):
-        name = f"traj_{idx}"
-        points: list[dict] = []
-
-        start_data = traj.get("start")
-        end_data = traj.get("end")
-        poses = traj.get("poses", [])
-
-        # First entry: explicit start coordinate
-        if start_data is not None:
-            points.append(
-                {
-                    "x": start_data["x"],
-                    "y": start_data["y"],
-                    "heading": start_data.get("heading", 0.0),
-                }
-            )
-
-        # All sampled poses along the path
-        for p in poses:
-            points.append(
-                {
-                    "x": p["x"],
-                    "y": p["y"],
-                    "heading": p.get("heading", 0.0),
-                }
-            )
-
-        # Last entry: explicit end coordinate
-        if end_data is not None:
-            points.append(
-                {
-                    "x": end_data["x"],
-                    "y": end_data["y"],
-                    "heading": end_data.get("heading", 0.0),
-                }
-            )
-
-        flattened[name] = points
-
-    return flattened
+from main import (
+    create_visualization_pdf,
+    flatten_trajectories,
+    generate_trajectories_from_config,
+    stitch_trajectories_to_waypoints,
+)
 
 
 def process_csv(
@@ -84,23 +38,31 @@ def process_csv(
     )
 
     result, section_times = generate_trajectories_from_config(config)
+    trajectories_raw = result.get("trajectories", [])
+    stitched_trajectories = stitch_trajectories_to_waypoints(trajectories_raw)
 
-    # Preserve original rich structure
+    total_time_all = sum(section_times)
+    times_block = {
+        "total": total_time_all,
+        "sections": [{"section": i + 1, "time": t} for i, t in enumerate(section_times)],
+    }
+
+    # Preserve structure with stitched poses
     spliced_path = output_dir / "myoutput_spliced.json"
     with spliced_path.open("w", encoding="utf-8") as f_spliced:
-        json.dump(result, f_spliced, indent=2)
+        json.dump({"trajectories": stitched_trajectories}, f_spliced, indent=2)
 
-    # Flatten into traj_n format
-    flattened = _flatten_trajectories(result)
+    # Flatten into traj_n format using stitched poses and include timing summary
+    flattened = flatten_trajectories(stitched_trajectories)
+    flat_payload = {"times": times_block, "trajectories": flattened}
     flat_path = output_dir / "my_output.json"
     with flat_path.open("w", encoding="utf-8") as f_flat:
-        json.dump(flattened, f_flat, indent=2)
+        json.dump(flat_payload, f_flat, indent=2)
 
-    # Visualization PDF for this CSV
-    trajectories = result.get("trajectories", [])
-    if trajectories:
+    # Visualization PDF for this CSV (stitched geometry)
+    if stitched_trajectories:
         pdf_path = output_dir / "trajectories_stitched.pdf"
-        create_visualization_pdf(trajectories, section_times, str(pdf_path))
+        create_visualization_pdf(stitched_trajectories, section_times, str(pdf_path), already_stitched=True)
 
 
 def main() -> None:

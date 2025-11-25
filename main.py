@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+from pathlib import Path
 
 from PathCreator import pathCreator
 from Pose2D import Pose2D
@@ -15,6 +16,34 @@ def pose_from_dict(data: dict) -> Pose2D:
 
 def pose_to_dict(pose: Pose2D) -> dict:
     return {"x": pose.getX(), "y": pose.getY(), "heading": pose.getHeading()}
+
+
+def _reflect_poses_across_segment(start: dict, end: dict, poses: list[dict]) -> list[dict]:
+    """
+    Mirror sampled poses across the line from start->end.
+    Keeps endpoints on the line; headings are left unchanged.
+    """
+    sx, sy = start["x"], start["y"]
+    ex, ey = end["x"], end["y"]
+
+    vx = ex - sx
+    vy = ey - sy
+    denom = vx * vx + vy * vy
+    if denom < 1e-12:
+        return poses
+
+    reflected: list[dict] = []
+    for p in poses:
+        px, py = p["x"], p["y"]
+        # projection of (P - S) onto v
+        t = ((px - sx) * vx + (py - sy) * vy) / denom
+        qx = sx + t * vx
+        qy = sy + t * vy
+        rx = 2 * qx - px
+        ry = 2 * qy - py
+        reflected.append({"x": rx, "y": ry, "heading": p.get("heading", 0.0)})
+
+    return reflected
 
 
 def _find_best_b_for_segment(
@@ -77,7 +106,6 @@ def _compute_global_trapezoid_time(total_length: float, vi: float, vf: float, ma
         return t_accel + t_cruise + t_decel
     else:
         # Triangular profile: never reach vf, accelerate then decelerate symmetrically
-        # total_length = a * t_accel^2  =>  t_accel = sqrt(total_length / a)
         t_accel = math.sqrt(total_length / a)
         return 2.0 * t_accel
 
@@ -99,21 +127,26 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
     segment_lengths: list[float] = []
     segment_vectors: list[tuple[float, float]] = []
 
+    prev_end_heading: float | None = None
+
     for idx, seg in enumerate(config.get("segments", []), start=1):
-        start_data = seg["start"]
-        end_data = seg["end"]
+        start_data = dict(seg["start"])
+        end_data = dict(seg["end"])
         initial_b = float(seg.get("curveIntensity", default_b))
 
-        P0 = pose_from_dict(start_data)
-        P2 = pose_from_dict(end_data)
+        start_heading = prev_end_heading if prev_end_heading is not None else start_data.get("heading", 0.0)
+        end_heading = end_data.get("heading", 0.0)
 
-        # Use the provided curve intensity directly for geometry
+        # Use continuity for heading at the start of each segment
+        start_data["heading"] = start_heading
+
+        P0 = Pose2D(start_data["x"], start_data["y"], start_heading)
+        P2 = Pose2D(end_data["x"], end_data["y"], end_heading)
+
         final_b = initial_b
 
-        # Generate poses along this segment with the chosen intensity
         poses = pc.GenerateActualPath(P0, P2, final_b, steps=steps)
 
-        # Compute arc length of this segment for global time calculation
         p0_vec = [P0.getX(), P0.getY()]
         p2_vec = [P2.getX(), P2.getY()]
         tg = TrajectoryGeneration(p0_vec, p2_vec, final_b)
@@ -122,10 +155,15 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
         segment_lengths.append(length)
         print(f"[DEBUG] segment {idx} length with b={final_b}: {length}")
 
-        # straight-line vector for heading-change estimation
         dx = end_data["x"] - start_data["x"]
         dy = end_data["y"] - start_data["y"]
         segment_vectors.append((dx, dy))
+
+        pose_dicts = [pose_to_dict(p) for p in poses]
+
+        # Mirror segments 2 and 3 across their chord to match desired layout
+        if idx in (2, 3):
+            pose_dicts = _reflect_poses_across_segment(start_data, end_data, pose_dicts)
 
         trajectories.append(
             {
@@ -133,16 +171,17 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
                 "end": end_data,
                 "initialCurveIntensity": initial_b,
                 "curveIntensity": final_b,
-                "poses": [pose_to_dict(p) for p in poses],
+                "poses": pose_dicts,
             }
         )
+
+        prev_end_heading = end_heading
 
     total_length = sum(segment_lengths)
     print(f"[DEBUG] total path length = {total_length}")
     total_time_linear = _compute_global_trapezoid_time(total_length, vi, vf, max_accel)
     print(f"[DEBUG] global trapezoid time (translation only) = {total_time_linear}")
 
-    # Extra time due to heading changes at segment junctions.
     base_turn_time_90 = 0.5  # seconds for 90 deg at 5 m/s
     base_turn_speed = 5.0    # m/s reference
 
@@ -177,13 +216,11 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
     total_turn_time = sum(corner_times)
     total_time = total_time_linear + total_turn_time
 
-    # Distribute translation time by segment length
     section_times: list[float] = [0.0 for _ in segment_lengths]
     if total_length > 0:
         for i, seg_len in enumerate(segment_lengths):
             section_times[i] = total_time_linear * (seg_len / total_length)
 
-    # Distribute heading-change time: split each corner equally between its two adjacent segments
     per_segment_turn = [0.0 for _ in segment_lengths]
     for i, t_corner in enumerate(corner_times):
         per_segment_turn[i] += 0.5 * t_corner
@@ -220,7 +257,6 @@ def _compute_distance_time_profile(
             t_global += float(section_times[seg_idx])
             continue
 
-        # Per-segment arc length built from sampled poses
         seg_distances = [0.0]
         seg_len = 0.0
         for i in range(1, len(poses)):
@@ -259,8 +295,176 @@ def _compute_distance_time_profile(
     return times, distances, speeds
 
 
+def stitch_trajectories_to_waypoints(trajectories: list[dict]) -> list[dict]:
+    """
+    Rescale/rotate each segment's sampled poses so the endpoints land exactly on
+    the CSV waypoints (matches the stitched PDF view).
+    """
+    if not trajectories:
+        return []
+
+    waypoints: list[dict] = []
+    first_start = trajectories[0].get("start")
+    if first_start:
+        waypoints.append(first_start)
+    for traj in trajectories:
+        end_pt = traj.get("end")
+        if end_pt:
+            waypoints.append(end_pt)
+
+    stitched: list[dict] = []
+
+    for idx, traj in enumerate(trajectories):
+        poses = traj.get("poses", [])
+        if not poses:
+            stitched.append(traj)
+            continue
+
+        if idx >= len(waypoints) - 1:
+            stitched.append(traj)
+            continue
+
+        start_wp = waypoints[idx]
+        end_wp = waypoints[idx + 1]
+        if not start_wp or not end_wp:
+            stitched.append(traj)
+            continue
+
+        raw_xs = [p["x"] for p in poses]
+        raw_ys = [p["y"] for p in poses]
+        headings = [p.get("heading", 0.0) for p in poses]
+
+        if not raw_xs or not raw_ys:
+            stitched.append(traj)
+            continue
+
+        local_dx = raw_xs[-1] - raw_xs[0]
+        local_dy = raw_ys[-1] - raw_ys[0]
+        global_dx = end_wp["x"] - start_wp["x"]
+        global_dy = end_wp["y"] - start_wp["y"]
+
+        if local_dx * global_dx + local_dy * global_dy < 0:
+            raw_xs = list(reversed(raw_xs))
+            raw_ys = list(reversed(raw_ys))
+            headings = list(reversed(headings))
+
+        p0x, p0y = raw_xs[0], raw_ys[0]
+        p1x, p1y = raw_xs[-1], raw_ys[-1]
+
+        v_local_x = p1x - p0x
+        v_local_y = p1y - p0y
+        v_local_len = math.hypot(v_local_x, v_local_y)
+
+        w_global_x = global_dx
+        w_global_y = global_dy
+        w_global_len = math.hypot(w_global_x, w_global_y)
+
+        stitched_poses: list[dict] = []
+
+        if v_local_len < 1e-6 or w_global_len < 1e-6:
+            stitched_poses.append(
+                {"x": start_wp["x"], "y": start_wp["y"], "heading": headings[0]}
+            )
+            stitched_poses.append(
+                {"x": end_wp["x"], "y": end_wp["y"], "heading": headings[-1]}
+            )
+        else:
+            scale = w_global_len / v_local_len
+
+            ux_local = v_local_x / v_local_len
+            uy_local = v_local_y / v_local_len
+            ux_global = w_global_x / w_global_len
+            uy_global = w_global_y / w_global_len
+
+            cos_theta = max(-1.0, min(1.0, ux_local * ux_global + uy_local * uy_global))
+            sin_theta = ux_local * uy_global - uy_local * ux_global
+
+            for x, y, h in zip(raw_xs, raw_ys, headings):
+                lx = (x - p0x) * scale
+                ly = (y - p0y) * scale
+
+                rx = cos_theta * lx - sin_theta * ly
+                ry = sin_theta * lx + cos_theta * ly
+
+                gx = start_wp["x"] + rx
+                gy = start_wp["y"] + ry
+
+                stitched_poses.append({"x": gx, "y": gy, "heading": h})
+
+        stitched.append({**traj, "poses": stitched_poses})
+
+    return stitched
+
+
+def flatten_trajectories(trajectories: list[dict]) -> dict[str, list[dict]]:
+    """
+    Flatten trajectories into traj_n arrays used by my_output.json.
+    """
+    flattened: dict[str, list[dict]] = {}
+
+    for idx, traj in enumerate(trajectories, start=1):
+        name = f"traj_{idx}"
+        points: list[dict] = []
+
+        start_data = traj.get("start")
+        end_data = traj.get("end")
+        poses = traj.get("poses", [])
+
+        if start_data is not None:
+            points.append(
+                {
+                    "x": start_data["x"],
+                    "y": start_data["y"],
+                    "heading": start_data.get("heading", 0.0),
+                }
+            )
+
+        for p in poses:
+            points.append(
+                {
+                    "x": p["x"],
+                    "y": p["y"],
+                    "heading": p.get("heading", 0.0),
+                }
+            )
+
+        if end_data is not None:
+            points.append(
+                {
+                    "x": end_data["x"],
+                    "y": end_data["y"],
+                    "heading": end_data.get("heading", 0.0),
+                }
+            )
+
+        flattened[name] = points
+
+    return flattened
+
+
+def _next_output_dir(base_dir: Path) -> Path:
+    """
+    Find the next numbered subdirectory under base_dir named 'output N'.
+    """
+    base_dir.mkdir(parents=True, exist_ok=True)
+    max_idx = 0
+    for p in base_dir.iterdir():
+        if not p.is_dir():
+            continue
+        name = p.name.strip()
+        if not name.lower().startswith("output "):
+            continue
+        try:
+            idx = int(name.split(" ", 1)[1])
+            max_idx = max(max_idx, idx)
+        except (IndexError, ValueError):
+            continue
+    next_idx = max_idx + 1
+    return base_dir / f"output {next_idx}"
+
+
 def create_visualization_pdf(
-    trajectories: list[dict], section_times: list[float], pdf_path: str
+    trajectories: list[dict], section_times: list[float], pdf_path: str, already_stitched: bool = False
 ) -> None:
     """
     Create a PDF containing:
@@ -279,9 +483,10 @@ def create_visualization_pdf(
         print("No trajectories to visualize.")
         return
 
+    stitched_trajs = trajectories if already_stitched else stitch_trajectories_to_waypoints(trajectories)
+
     with PdfPages(pdf_path) as pdf:
-        # Individual segment plots: "Trajectory 1, 2, ..."
-        for idx, traj in enumerate(trajectories, start=1):
+        for idx, traj in enumerate(stitched_trajs, start=1):
             poses = traj.get("poses", [])
             if not poses:
                 continue
@@ -300,120 +505,27 @@ def create_visualization_pdf(
             pdf.savefig(fig)
             plt.close(fig)
 
-        # Combined XY plot of all trajectories, stitched end-to-start
         fig, ax = plt.subplots()
 
-        # Waypoints derived directly from segment start/end (CSV rows)
         waypoints: list[dict] = []
-        if trajectories:
-            waypoints.append(trajectories[0]["start"])
-            for traj in trajectories:
+        if stitched_trajs:
+            waypoints.append(stitched_trajs[0]["start"])
+            for traj in stitched_trajs:
                 waypoints.append(traj["end"])
 
-        # Plot each segment curve, but transform its local geometry so that
-        # the first and last poses land exactly on the corresponding
-        # waypoint coordinates. This keeps the CSV waypoints authoritative.
-        for idx, traj in enumerate(trajectories):
+        for idx, traj in enumerate(stitched_trajs):
             poses = traj.get("poses", [])
             if not poses:
                 continue
 
-            if not waypoints or idx + 1 >= len(waypoints):
-                continue
-
-            start_wp = waypoints[idx]
-            end_wp = waypoints[idx + 1]
-
-            raw_xs = [p["x"] for p in poses]
-            raw_ys = [p["y"] for p in poses]
-
-            # Ensure the sampled curve runs from start->end; reverse if it is backward.
-            local_dx = raw_xs[-1] - raw_xs[0]
-            local_dy = raw_ys[-1] - raw_ys[0]
-            global_dx = end_wp["x"] - start_wp["x"]
-            global_dy = end_wp["y"] - start_wp["y"]
-            if local_dx * global_dx + local_dy * global_dy < 0:
-                raw_xs = list(reversed(raw_xs))
-                raw_ys = list(reversed(raw_ys))
-
-            # Local endpoints from the generated curve
-            p0x, p0y = raw_xs[0], raw_ys[0]
-            p1x, p1y = raw_xs[-1], raw_ys[-1]
-
-            v_local_x = p1x - p0x
-            v_local_y = p1y - p0y
-            v_local_len = math.hypot(v_local_x, v_local_y)
-
-            w_global_x = end_wp["x"] - start_wp["x"]
-            w_global_y = end_wp["y"] - start_wp["y"]
-            w_global_len = math.hypot(w_global_x, w_global_y)
-
-            if v_local_len < 1e-6 or w_global_len < 1e-6:
-                # Degenerate segment; just draw a straight line between waypoints.
-                ax.plot(
-                    [start_wp["x"], end_wp["x"]],
-                    [start_wp["y"], end_wp["y"]],
-                    linewidth=1.5,
-                    label=f"Segment {idx + 1}",
-                )
-                continue
-
-            # Uniform scale so arc length matches the waypoint chord length
-            scale = w_global_len / v_local_len
-
-            # Unit vectors
-            ux_local = v_local_x / v_local_len
-            uy_local = v_local_y / v_local_len
-            ux_global = w_global_x / w_global_len
-            uy_global = w_global_y / w_global_len
-
-            # Rotation that maps local direction to global direction
-            cos_theta = ux_local * ux_global + uy_local * uy_global
-            # Clamp for safety
-            cos_theta = max(-1.0, min(1.0, cos_theta))
-            sin_theta = ux_local * uy_global - uy_local * ux_global
-
-            def _transform_point(x: float, y: float) -> tuple[float, float]:
-                # Shift so p0 is at the origin
-                lx = x - p0x
-                ly = y - p0y
-
-                # Scale
-                lx *= scale
-                ly *= scale
-
-                # Rotate
-                rx = cos_theta * lx - sin_theta * ly
-                ry = sin_theta * lx + cos_theta * ly
-
-                # Translate to the global start waypoint
-                gx = start_wp["x"] + rx
-                gy = start_wp["y"] + ry
-                return gx, gy
-
-            xs, ys = zip(*(_transform_point(x, y) for x, y in zip(raw_xs, raw_ys)))
+            xs = [p["x"] for p in poses]
+            ys = [p["y"] for p in poses]
             ax.plot(xs, ys, linewidth=1.5, label=f"Segment {idx + 1}")
 
-        # Plot the CSV waypoints themselves, in order, as authoritative points.
         if waypoints:
             wx = [p["x"] for p in waypoints]
             wy = [p["y"] for p in waypoints]
             ax.plot(wx, wy, "o", color="red", markersize=5, label="Waypoints")
-
-            highlight_indices = set(range(len(waypoints)))
-            if highlight_indices:
-                hx = [p["x"] for i, p in enumerate(waypoints) if i in highlight_indices]
-                hy = [p["y"] for i, p in enumerate(waypoints) if i in highlight_indices]
-                ax.scatter(
-                    hx,
-                    hy,
-                    s=80,
-                    facecolors="yellow",
-                    edgecolors="black",
-                    linewidths=1.5,
-                    zorder=5,
-                    label="Waypoints (highlighted)",
-                )
 
             for i, p in enumerate(waypoints):
                 annotate_style: dict = {
@@ -427,7 +539,6 @@ def create_visualization_pdf(
                         "lw": 0.5,
                     },
                 }
-
                 ax.annotate(
                     str(i),
                     (p["x"], p["y"]),
@@ -451,8 +562,7 @@ def create_visualization_pdf(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-        # Distance and speed versus time
-        times, distances, speeds = _compute_distance_time_profile(trajectories, section_times)
+        times, distances, speeds = _compute_distance_time_profile(stitched_trajs, section_times)
         if times and distances:
             fig, ax1 = plt.subplots()
             ax1.plot(times, distances, color="tab:blue", label="Distance")
@@ -494,6 +604,11 @@ def main() -> None:
         default="trajectories.pdf",
         help="Output PDF file for trajectory visualizations.",
     )
+    parser.add_argument(
+        "--output-dir",
+        default="output",
+        help="Directory where numbered outputs will be written (default: output).",
+    )
 
     parser.add_argument("--vi", type=float, default=0.0, help="Initial velocity.")
     parser.add_argument(
@@ -534,68 +649,45 @@ def main() -> None:
         default_curve_intensity=args.curve_intensity,
     )
 
+    base_output_dir = Path(args.output_dir)
+    run_output_dir = _next_output_dir(base_output_dir)
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+
     result, section_times = generate_trajectories_from_config(config)
+    trajectories_raw = result.get("trajectories", [])
+    stitched_trajectories = stitch_trajectories_to_waypoints(trajectories_raw)
 
     print("section time")
     total_time_all = 0.0
+    section_time_labels: list[dict] = []
     for idx, t in enumerate(section_times, start=1):
         print(f"section {idx}: {t}")
         total_time_all += t
+        section_time_labels.append({"section": idx, "time": t})
     print(f"total time: {total_time_all}")
+    times_block = {"total": total_time_all, "sections": section_time_labels}
 
-    # 1) Preserve the original output format as myoutput_spliced.json
-    with open("myoutput_spliced.json", "w", encoding="utf-8") as f_spliced:
-        json.dump(result, f_spliced, indent=2)
+    # Resolve output paths inside the numbered output directory
+    spliced_path = run_output_dir / "myoutput_spliced.json"
+    flat_path = run_output_dir / Path(args.output).name
+    pdf_path = run_output_dir / Path(args.pdf).name
 
-    # 2) Build the new flattened-per-trajectory format for my_output.json
-    trajectories = result.get("trajectories", [])
-    flattened: dict[str, list[dict]] = {}
-    for idx, traj in enumerate(trajectories, start=1):
-        name = f"traj_{idx}"
-        points: list[dict] = []
+    # 1) stitched structure for downstream use
+    stitched_result = {"trajectories": stitched_trajectories}
+    with spliced_path.open("w", encoding="utf-8") as f_spliced:
+        json.dump(stitched_result, f_spliced, indent=2)
 
-        start_data = traj.get("start")
-        end_data = traj.get("end")
-        poses = traj.get("poses", [])
+    # 2) flattened stitched poses with timing summary
+    flattened = flatten_trajectories(stitched_trajectories)
+    output_payload = {"times": times_block, "trajectories": flattened}
+    with flat_path.open("w", encoding="utf-8") as f_flat:
+        json.dump(output_payload, f_flat, indent=2)
 
-        # First entry: explicit start coordinate
-        if start_data is not None:
-            points.append(
-                {
-                    "x": start_data["x"],
-                    "y": start_data["y"],
-                    "heading": start_data.get("heading", 0.0),
-                }
-            )
+    if stitched_trajectories:
+        create_visualization_pdf(stitched_trajectories, section_times, str(pdf_path), already_stitched=True)
+        print(f"Saved trajectory visualizations to {pdf_path}")
 
-        # All sampled poses along the path
-        for p in poses:
-            points.append(
-                {
-                    "x": p["x"],
-                    "y": p["y"],
-                    "heading": p.get("heading", 0.0),
-                }
-            )
-
-        # Last entry: explicit end coordinate
-        if end_data is not None:
-            points.append(
-                {
-                    "x": end_data["x"],
-                    "y": end_data["y"],
-                    "heading": end_data.get("heading", 0.0),
-                }
-            )
-
-        flattened[name] = points
-
-    with open(args.output, "w", encoding="utf-8") as f_flat:
-        json.dump(flattened, f_flat, indent=2)
-
-    if trajectories:
-        create_visualization_pdf(trajectories, section_times, args.pdf)
-        print(f"Saved trajectory visualizations to {args.pdf}")
+    print(f"Outputs written to {run_output_dir}")
 
 
 if __name__ == "__main__":
