@@ -5,10 +5,12 @@ from pathlib import Path
 from generate_input_from_csv import build_config_from_csv
 from main import (
     create_visualization_pdf,
+    discretize_trajectories,
     flatten_trajectories,
     generate_trajectories_from_config,
     stitch_trajectories_to_waypoints,
 )
+from trapezoidMotionProfile import trapezoidMotionProfile
 
 
 def process_csv(
@@ -20,6 +22,7 @@ def process_csv(
     max_deccel: float,
     steps: int,
     default_curve_intensity: float,
+    sample_period_ms: float,
 ) -> None:
     """
     Run the full trajectory generation pipeline for a single CSV,
@@ -35,6 +38,14 @@ def process_csv(
         max_deccel=max_deccel,
         steps=steps,
         default_curve_intensity=default_curve_intensity,
+    )
+
+    mp_cfg = config.get("motionProfile", {})
+    pdf_motion_profile = trapezoidMotionProfile(
+        float(mp_cfg.get("vi", vi)),
+        float(mp_cfg.get("vf", vf)),
+        float(mp_cfg.get("maxAccel", max_accel)),
+        float(mp_cfg.get("maxDecel", max_deccel)),
     )
 
     result, section_times = generate_trajectories_from_config(config)
@@ -59,10 +70,23 @@ def process_csv(
     with flat_path.open("w", encoding="utf-8") as f_flat:
         json.dump(flat_payload, f_flat, indent=2)
 
+    # Discretised timeline at fixed sample period
+    sample_period_s = max(sample_period_ms / 1000.0, 1e-6)
+    discretised_payload = discretize_trajectories(stitched_trajectories, section_times, sample_period_s)
+    discretised_path = output_dir / "discretised_output.json"
+    with discretised_path.open("w", encoding="utf-8") as f_disc:
+        json.dump(discretised_payload, f_disc, indent=2)
+
     # Visualization PDF for this CSV (stitched geometry)
     if stitched_trajectories:
         pdf_path = output_dir / "trajectories_stitched.pdf"
-        create_visualization_pdf(stitched_trajectories, section_times, str(pdf_path), already_stitched=True)
+        create_visualization_pdf(
+            stitched_trajectories,
+            section_times,
+            str(pdf_path),
+            already_stitched=True,
+            motion_profile=pdf_motion_profile,
+        )
 
 
 def main() -> None:
@@ -110,6 +134,12 @@ def main() -> None:
         default=5.05,
         help="Default curve intensity (b) for all segments.",
     )
+    parser.add_argument(
+        "--sample-period-ms",
+        type=float,
+        default=20.0,
+        help="Output period in milliseconds for discretised_output.json (default: 20 ms).",
+    )
 
     args = parser.parse_args()
 
@@ -137,6 +167,7 @@ def main() -> None:
             max_deccel=args.max_deccel,
             steps=args.steps,
             default_curve_intensity=args.curve_intensity,
+            sample_period_ms=args.sample_period_ms,
         )
 
 

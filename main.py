@@ -110,6 +110,86 @@ def _compute_global_trapezoid_time(total_length: float, vi: float, vf: float, ma
         return 2.0 * t_accel
 
 
+def _solve_time_for_step(vi: float, dx: float, a: float) -> float | None:
+    """
+    Solve time to traverse distance dx starting at velocity vi with constant accel a.
+    Mirrors TrajectoryGeneration.time_Integrand.
+    """
+    discriminant = vi * vi + 2.0 * a * dx
+    if discriminant < 0:
+        return None
+
+    sqrt_disc = math.sqrt(discriminant)
+    t_plus = (-vi + sqrt_disc) / a
+    t_minus = (-vi - sqrt_disc) / a
+
+    potential_times = [t for t in (t_plus, t_minus) if t > 0]
+    if not potential_times:
+        return None
+
+    return min(potential_times)
+
+
+def _compute_section_times_with_profile(
+    segments: list[dict],
+    motion_profile: trapezoidMotionProfile,
+    final_velocity_target: float | None = None,
+) -> tuple[list[float], float, float, bool]:
+    """
+    Integrate time over all segments using per-slice kinematics.
+    Returns (section_times, total_time, final_velocity, broken_flag).
+    """
+    a_accel = float(motion_profile.getMaxAccel())
+    a_decel = float(abs(motion_profile.getMaxDeccel()))
+    v_max = float(motion_profile.vf)
+    if a_accel <= 0.0 or a_decel <= 0.0 or v_max <= 0.0:
+        return [0.0 for _ in segments], 0.0, float(motion_profile.vi), True
+
+    target_final_velocity = float(motion_profile.vi) if final_velocity_target is None else float(final_velocity_target)
+
+    section_times = [0.0 for _ in segments]
+    velocity = float(motion_profile.vi)
+
+    total_remaining = 0.0
+    for seg in segments:
+        total_remaining += sum(dx for dx in seg.get("slices", []) if dx > 0)
+
+    if total_remaining <= 0.0:
+        return section_times, 0.0, velocity, True
+
+    remaining_distance = total_remaining
+
+    for seg_idx, seg in enumerate(segments):
+        for dx in seg.get("slices", []):
+            if dx <= 0:
+                continue
+
+            braking_distance = max(0.0, (velocity * velocity - target_final_velocity * target_final_velocity) / (2.0 * a_decel))
+
+            if braking_distance >= remaining_distance:
+                a = -a_decel
+            else:
+                if velocity < v_max:
+                    a = a_accel
+                else:
+                    a = 0.0
+
+            if abs(a) < 1e-9:
+                if velocity <= 0.0:
+                    return section_times, sum(section_times), velocity, True
+                dt = dx / velocity
+            else:
+                dt = _solve_time_for_step(velocity, dx, a)
+                if dt is None:
+                    return section_times, sum(section_times), velocity, True
+
+            section_times[seg_idx] += dt
+            velocity += a * dt
+            remaining_distance -= dx
+
+    return section_times, sum(section_times), velocity, False
+
+
 def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
     mp_cfg = config.get("motionProfile", {})
     vi = float(mp_cfg.get("vi", 0.0))
@@ -122,10 +202,12 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
 
     steps = int(config.get("steps", 100))
     default_b = float(config.get("defaultCurveIntensity", 1.0))
+    time_steps = int(config.get("timeIntegrationSteps", 2000))
 
     trajectories = []
     segment_lengths: list[float] = []
     segment_vectors: list[tuple[float, float]] = []
+    segments_for_time: list[dict] = []
 
     prev_end_heading: float | None = None
 
@@ -151,13 +233,21 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
         p2_vec = [P2.getX(), P2.getY()]
         tg = TrajectoryGeneration(p0_vec, p2_vec, final_b)
         low, up = tg.bounds()
-        length = tg.lengthAlongTheCurve(low, up, steps=10000)
+        slice_lengths = tg.lengthAlongTheCurveArray(steps=time_steps)
+        length = sum(dx for dx in slice_lengths if dx > 0)
         segment_lengths.append(length)
         print(f"[DEBUG] segment {idx} length with b={final_b}: {length}")
 
         dx = end_data["x"] - start_data["x"]
         dy = end_data["y"] - start_data["y"]
         segment_vectors.append((dx, dy))
+
+        segments_for_time.append(
+            {
+                "slices": slice_lengths,
+                "length": length,
+            }
+        )
 
         pose_dicts = [pose_to_dict(p) for p in poses]
 
@@ -177,10 +267,20 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
 
         prev_end_heading = end_heading
 
+    section_times, total_time_linear, end_velocity, broken = _compute_section_times_with_profile(
+        segments_for_time, motion_profile, final_velocity_target=vi
+    )
     total_length = sum(segment_lengths)
     print(f"[DEBUG] total path length = {total_length}")
-    total_time_linear = _compute_global_trapezoid_time(total_length, vi, vf, max_accel)
-    print(f"[DEBUG] global trapezoid time (translation only) = {total_time_linear}")
+    if broken:
+        total_time_linear = _compute_global_trapezoid_time(total_length, vi, vf, max_accel)
+        print(f"[DEBUG] fallback global trapezoid time (translation only) = {total_time_linear}")
+        section_times = [0.0 for _ in segment_lengths]
+        if total_length > 0:
+            for i, seg_len in enumerate(segment_lengths):
+                section_times[i] = total_time_linear * (seg_len / total_length)
+    else:
+        print(f"[DEBUG] integrated translation time (profile-based) = {total_time_linear}")
 
     base_turn_time_90 = 0.5  # seconds for 90 deg at 5 m/s
     base_turn_speed = 5.0    # m/s reference
@@ -234,13 +334,14 @@ def generate_trajectories_from_config(config: dict) -> tuple[dict, list[float]]:
 
 def _compute_distance_time_profile(
     trajectories: list[dict], section_times: list[float]
-) -> tuple[list[float], list[float], list[float]]:
+) -> tuple[list[float], list[float], list[float], float]:
     """
     Build distance- and speed-vs-time profiles using the
     sampled poses on each segment and the per-segment durations.
+    Returns the cumulative path length for downstream visualisations.
     """
     if not trajectories or not section_times:
-        return [], [], []
+        return [], [], [], 0.0
 
     n_segments = min(len(trajectories), len(section_times))
 
@@ -292,7 +393,103 @@ def _compute_distance_time_profile(
         else:
             speeds.append(ds / dt)
 
-    return times, distances, speeds
+    return times, distances, speeds, s_global
+
+
+def _build_trapezoid_velocity_profile(
+    total_distance: float, motion_profile: trapezoidMotionProfile | None
+) -> tuple[list[float], list[float], dict[str, dict[str, float]]]:
+    """
+    Construct the ideal trapezoid (or triangular) velocity profile based on the
+    configured motion profile limits and the provided total travel distance.
+    Returns the sampled velocity profile alongside metadata describing each stage.
+    """
+    if motion_profile is None or total_distance <= 1e-9:
+        return [], [], {}
+
+    a_accel = float(motion_profile.getMaxAccel())
+    a_decel = float(abs(motion_profile.getMaxDeccel()))
+    if a_accel <= 0.0 or a_decel <= 0.0:
+        return [], [], {}
+
+    v_start = float(motion_profile.vi)
+    v_end = float(motion_profile.vi)
+    v_max = float(motion_profile.vf)
+    v_max = max(v_max, v_start, v_end)
+
+    def _segment_distance(v0: float, v1: float, accel: float) -> float:
+        if accel <= 0.0 or v1 <= v0:
+            return 0.0
+        return (v1 * v1 - v0 * v0) / (2.0 * accel)
+
+    v_peak = v_max
+    d_accel = _segment_distance(v_start, v_peak, a_accel)
+    d_decel = _segment_distance(v_end, v_peak, a_decel)
+
+    if total_distance < d_accel + d_decel - 1e-9:
+        denom = (1.0 / (2.0 * a_accel)) + (1.0 / (2.0 * a_decel))
+        if denom <= 0.0:
+            return [], []
+        numer = total_distance + (v_start * v_start) / (2.0 * a_accel) + (v_end * v_end) / (2.0 * a_decel)
+        v_peak_sq = max(v_start * v_start, v_end * v_end, numer / denom)
+        v_peak = min(v_max, math.sqrt(max(0.0, v_peak_sq)))
+        d_accel = _segment_distance(v_start, v_peak, a_accel)
+        d_decel = _segment_distance(v_end, v_peak, a_decel)
+
+    d_cruise = max(0.0, total_distance - d_accel - d_decel)
+
+    def _segment_time(v0: float, v1: float, accel: float) -> float:
+        if accel <= 0.0 or v1 <= v0:
+            return 0.0
+        return (v1 - v0) / accel
+
+    t_accel = _segment_time(v_start, v_peak, a_accel)
+    t_decel = _segment_time(v_end, v_peak, a_decel)
+    t_cruise = d_cruise / v_peak if v_peak > 1e-9 else 0.0
+
+    total_time = t_accel + t_cruise + t_decel
+    if total_time <= 0.0:
+        if abs(v_start) < 1e-9:
+            return [], [], {}
+        cruise_time = total_distance / abs(v_start)
+        return [0.0, cruise_time], [v_start, v_start], {}
+
+    times = [0.0]
+    velocities = [v_start]
+    current_time = 0.0
+
+    if t_accel > 1e-9:
+        current_time += t_accel
+        times.append(current_time)
+        velocities.append(v_peak)
+
+    if t_cruise > 1e-9:
+        current_time += t_cruise
+        times.append(current_time)
+        velocities.append(v_peak)
+
+    if t_decel > 1e-9:
+        current_time += t_decel
+        times.append(current_time)
+        velocities.append(v_end)
+    elif abs(times[-1] - total_time) > 1e-9:
+        current_time = total_time
+        times.append(current_time)
+        velocities.append(v_end)
+
+    stage_info: dict[str, dict[str, float]] = {}
+    if t_accel > 1e-9:
+        stage_info["accel"] = {"start": 0.0, "end": t_accel, "accel": a_accel}
+    if t_cruise > 1e-9:
+        stage_info["cruise"] = {"start": t_accel, "end": t_accel + t_cruise}
+    if t_decel > 1e-9:
+        stage_info["decel"] = {
+            "start": total_time - t_decel,
+            "end": total_time,
+            "accel": -a_decel,
+        }
+
+    return times, velocities, stage_info
 
 
 def stitch_trajectories_to_waypoints(trajectories: list[dict]) -> list[dict]:
@@ -442,6 +639,185 @@ def flatten_trajectories(trajectories: list[dict]) -> dict[str, list[dict]]:
     return flattened
 
 
+def _cumulative_distances_for_poses(poses: list[dict]) -> tuple[list[float], float]:
+    """
+    Return cumulative distances between consecutive poses in a segment.
+    """
+    if not poses:
+        return [], 0.0
+
+    distances = [0.0]
+    total = 0.0
+    for i in range(1, len(poses)):
+        x0, y0 = poses[i - 1]["x"], poses[i - 1]["y"]
+        x1, y1 = poses[i]["x"], poses[i]["y"]
+        total += math.hypot(x1 - x0, y1 - y0)
+        distances.append(total)
+
+    return distances, total
+
+
+def _interpolate_pose_for_distance(poses: list[dict], cumulative: list[float], target_distance: float) -> dict:
+    """
+    Linearly interpolate pose (x, y, heading) at a target distance along a segment.
+    """
+    if not poses:
+        return {"x": 0.0, "y": 0.0, "heading": 0.0}
+
+    if not cumulative:
+        cumulative = [0.0 for _ in poses]
+
+    if target_distance <= 0.0:
+        p = poses[0]
+        return {"x": p["x"], "y": p["y"], "heading": p.get("heading", 0.0)}
+
+    max_distance = cumulative[-1] if cumulative else 0.0
+    if target_distance >= max_distance:
+        p = poses[-1]
+        return {"x": p["x"], "y": p["y"], "heading": p.get("heading", 0.0)}
+
+    for idx in range(1, len(cumulative)):
+        if target_distance <= cumulative[idx]:
+            prev_dist = cumulative[idx - 1]
+            span = cumulative[idx] - prev_dist
+            if span <= 1e-9:
+                p = poses[idx]
+                return {"x": p["x"], "y": p["y"], "heading": p.get("heading", 0.0)}
+
+            ratio = (target_distance - prev_dist) / span
+            p0 = poses[idx - 1]
+            p1 = poses[idx]
+            x = p0["x"] + ratio * (p1["x"] - p0["x"])
+            y = p0["y"] + ratio * (p1["y"] - p0["y"])
+            h0 = p0.get("heading", 0.0)
+            h1 = p1.get("heading", 0.0)
+            heading = h0 + ratio * (h1 - h0)
+            return {"x": x, "y": y, "heading": heading}
+
+    p = poses[-1]
+    return {"x": p["x"], "y": p["y"], "heading": p.get("heading", 0.0)}
+
+
+def discretize_trajectories(
+    trajectories: list[dict], section_times: list[float], sample_period_s: float = 0.02
+) -> dict:
+    """
+    Produce a uniformly-timed sample set across stitched trajectories.
+    """
+    sample_period_s = max(sample_period_s, 1e-6)
+
+    if not trajectories or not section_times:
+        return {
+            "dt": sample_period_s,
+            "totalTime": 0.0,
+            "totalPathLength": 0.0,
+            "numSamples": 0,
+            "samples": [],
+        }
+
+    n_segments = min(len(trajectories), len(section_times))
+    segments: list[dict] = []
+    time_cursor = 0.0
+    distance_cursor = 0.0
+
+    for i in range(n_segments):
+        traj = trajectories[i]
+        poses = traj.get("poses", [])
+        cumulative_dists, seg_len = _cumulative_distances_for_poses(poses)
+        seg_time = float(section_times[i])
+
+        segments.append(
+            {
+                "poses": poses,
+                "cumulative": cumulative_dists,
+                "length": seg_len,
+                "t_start": time_cursor,
+                "t_end": time_cursor + seg_time,
+                "dist_start": distance_cursor,
+                "start": traj.get("start"),
+                "end": traj.get("end"),
+            }
+        )
+
+        time_cursor += seg_time
+        distance_cursor += seg_len
+
+    total_time = time_cursor
+    total_path = distance_cursor
+
+    if total_time <= 0.0:
+        return {
+            "dt": sample_period_s,
+            "totalTime": 0.0,
+            "totalPathLength": total_path,
+            "numSamples": 0,
+            "samples": [],
+        }
+
+    num_steps = int(math.floor(total_time / sample_period_s + 1e-9))
+    time_samples = [i * sample_period_s for i in range(num_steps + 1)]
+    if total_time - time_samples[-1] > 1e-9:
+        time_samples.append(total_time)
+
+    samples: list[dict] = []
+    seg_idx = 0
+
+    for t in time_samples:
+        while seg_idx < len(segments) - 1 and t > segments[seg_idx]["t_end"]:
+            seg_idx += 1
+
+        seg = segments[seg_idx]
+        seg_duration = seg["t_end"] - seg["t_start"]
+        poses = seg["poses"]
+        cumulative = seg["cumulative"]
+        seg_len = seg["length"]
+
+        if seg_duration <= 0.0 or seg_len <= 0.0 or not poses:
+            fallback = (
+                poses[0]
+                if poses
+                else seg["start"]
+                or seg["end"]
+                or {"x": 0.0, "y": 0.0, "heading": 0.0}
+            )
+            samples.append(
+                {
+                    "time": t,
+                    "x": fallback["x"],
+                    "y": fallback["y"],
+                    "heading": fallback.get("heading", 0.0),
+                    "distance": seg["dist_start"],
+                    "segment": seg_idx + 1,
+                }
+            )
+            continue
+
+        frac = (t - seg["t_start"]) / seg_duration
+        frac = max(0.0, min(1.0, frac))
+        local_distance = frac * seg_len
+
+        pose = _interpolate_pose_for_distance(poses, cumulative, local_distance)
+
+        samples.append(
+            {
+                "time": t,
+                "x": pose["x"],
+                "y": pose["y"],
+                "heading": pose["heading"],
+                "distance": seg["dist_start"] + local_distance,
+                "segment": seg_idx + 1,
+            }
+        )
+
+    return {
+        "dt": sample_period_s,
+        "totalTime": total_time,
+        "totalPathLength": total_path,
+        "numSamples": len(samples),
+        "samples": samples,
+    }
+
+
 def _next_output_dir(base_dir: Path) -> Path:
     """
     Find the next numbered subdirectory under base_dir named 'output N'.
@@ -464,13 +840,18 @@ def _next_output_dir(base_dir: Path) -> Path:
 
 
 def create_visualization_pdf(
-    trajectories: list[dict], section_times: list[float], pdf_path: str, already_stitched: bool = False
+    trajectories: list[dict],
+    section_times: list[float],
+    pdf_path: str,
+    already_stitched: bool = False,
+    motion_profile: trapezoidMotionProfile | None = None,
 ) -> None:
     """
     Create a PDF containing:
       - one XY plot per trajectory segment,
       - a combined XY plot showing all segments and waypoints,
-      - a distance-over-time plot with speed overlay.
+      - a distance-over-time plot with speed overlay,
+      - the trapezoid motion profile (velocity vs time) derived from the configured limits.
     """
     try:
         import matplotlib.pyplot as plt
@@ -478,6 +859,8 @@ def create_visualization_pdf(
     except ImportError:
         print("matplotlib is not installed; skipping PDF visualization.")
         return
+
+    plt.rcParams["figure.figsize"] = (10.5, 5.5)
 
     if not trajectories:
         print("No trajectories to visualize.")
@@ -498,7 +881,7 @@ def create_visualization_pdf(
             ax.plot(xs, ys, marker="o", markersize=2)
             ax.set_title(f"Trajectory {idx}: point {idx - 1} to point {idx}")
             ax.set_xlabel("X")
-            ax.set_ylabel("Y")
+            ax.set_ylabel("Y", rotation=0, labelpad=25)
             ax.grid(True)
             ax.axis("equal")
 
@@ -549,7 +932,7 @@ def create_visualization_pdf(
 
         ax.set_title("All Trajectories Combined (stitched to CSV waypoints)")
         ax.set_xlabel("X")
-        ax.set_ylabel("Y")
+        ax.set_ylabel("Y", rotation=0, labelpad=25)
         ax.grid(True)
         ax.axis("equal")
         ax.legend(
@@ -562,21 +945,98 @@ def create_visualization_pdf(
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-        times, distances, speeds = _compute_distance_time_profile(stitched_trajs, section_times)
+        times, distances, speeds, total_distance = _compute_distance_time_profile(stitched_trajs, section_times)
         if times and distances:
             fig, ax1 = plt.subplots()
             ax1.plot(times, distances, color="tab:blue", label="Distance")
             ax1.set_xlabel("Time (s)")
-            ax1.set_ylabel("Distance (m)", color="tab:blue")
+            ax1.set_ylabel("Distance (m)", color="tab:blue", rotation=0, labelpad=45)
             ax1.tick_params(axis="y", labelcolor="tab:blue")
             ax1.grid(True)
 
             ax2 = ax1.twinx()
             ax2.plot(times, speeds, color="tab:orange", label="Speed")
-            ax2.set_ylabel("Speed (m/s)", color="tab:orange")
+            ax2.set_ylabel("Speed (m/s)", color="tab:orange", rotation=0, labelpad=45)
             ax2.tick_params(axis="y", labelcolor="tab:orange")
 
             fig.suptitle("Distance and Speed vs Time")
+            pdf.savefig(fig)
+            plt.close(fig)
+
+        profile_times, profile_velocities, profile_stages = _build_trapezoid_velocity_profile(
+            total_distance, motion_profile
+        )
+        if profile_times and profile_velocities:
+            fig = plt.figure(figsize=(11.5, 5.0))
+            gs = fig.add_gridspec(1, 2, width_ratios=[3.2, 1.0], wspace=0.35)
+            ax = fig.add_subplot(gs[0, 0])
+            info_ax = fig.add_subplot(gs[0, 1])
+            info_ax.axis("off")
+            ax.plot(profile_times, profile_velocities, color="tab:green")
+            ax.set_title("Trapezoidal Motion Profile")
+            ax.set_xlabel("Time (s)")
+            ax.set_ylabel("Speed (m/s)", rotation=0, labelpad=30)
+            ax.grid(True)
+
+            annotation_lines: list[str] = []
+            accel_section: list[str] = []
+            accel_info = profile_stages.get("accel")
+            if accel_info:
+                accel_section.append(f"Acceleration: {accel_info['accel']:.2f} m/s/s")
+
+            cruise_info = profile_stages.get("cruise")
+            decel_info = profile_stages.get("decel")
+            if decel_info:
+                accel_section.append(f"Deceleration: {abs(decel_info['accel']):.2f} m/s/s")
+
+            if accel_section:
+                annotation_lines.append("Acceleration Magnitudes (m/s/s)")
+                annotation_lines.append("------------------------------")
+                for entry in accel_section:
+                    annotation_lines.append(f"  - {entry}")
+
+            max_velocity = motion_profile.vf if motion_profile is not None else None
+            if max_velocity is not None:
+                if annotation_lines:
+                    annotation_lines.append("")  # spacer
+                annotation_lines.append("Maximum Velocity (m/s)")
+                annotation_lines.append("----------------------")
+                annotation_lines.append(f"  - {max_velocity:.2f} m/s")
+
+            time_section: list[str] = []
+            if accel_info:
+                time_section.append(
+                    f"Acceleration: t={accel_info['start']:.2f}-{accel_info['end']:.2f}s"
+                )
+            if cruise_info:
+                time_section.append(
+                    f"Cruise: t={cruise_info['start']:.2f}-{cruise_info['end']:.2f}s"
+                )
+            if decel_info:
+                time_section.append(
+                    f"Deceleration: t={decel_info['start']:.2f}-{decel_info['end']:.2f}s"
+                )
+
+            if time_section:
+                if annotation_lines:
+                    annotation_lines.append("")  # spacer between sections
+                annotation_lines.append("Stage Timing (s)")
+                annotation_lines.append("------------------------------")
+                for entry in time_section:
+                    annotation_lines.append(f"  - {entry}")
+
+            if annotation_lines:
+                details_text = "\n".join(annotation_lines)
+                info_ax.text(
+                    0.0,
+                    1.0,
+                    details_text,
+                    ha="left",
+                    va="top",
+                    fontsize=10,
+                    bbox={"boxstyle": "round,pad=0.3", "fc": "white", "ec": "gray", "lw": 0.5},
+                )
+
             pdf.savefig(fig)
             plt.close(fig)
 
@@ -636,6 +1096,12 @@ def main() -> None:
         default=5.05,
         help="Default curve intensity (b) for all segments.",
     )
+    parser.add_argument(
+        "--sample-period-ms",
+        type=float,
+        default=20.0,
+        help="Output period in milliseconds for discretised_output.json (default: 20 ms).",
+    )
 
     args = parser.parse_args()
 
@@ -647,6 +1113,14 @@ def main() -> None:
         max_deccel=args.max_deccel,
         steps=args.steps,
         default_curve_intensity=args.curve_intensity,
+    )
+
+    mp_cfg = config.get("motionProfile", {})
+    pdf_motion_profile = trapezoidMotionProfile(
+        float(mp_cfg.get("vi", args.vi)),
+        float(mp_cfg.get("vf", args.vf)),
+        float(mp_cfg.get("maxAccel", args.max_accel)),
+        float(mp_cfg.get("maxDecel", args.max_deccel)),
     )
 
     base_output_dir = Path(args.output_dir)
@@ -671,6 +1145,7 @@ def main() -> None:
     spliced_path = run_output_dir / "myoutput_spliced.json"
     flat_path = run_output_dir / Path(args.output).name
     pdf_path = run_output_dir / Path(args.pdf).name
+    discretised_path = run_output_dir / "discretised_output.json"
 
     # 1) stitched structure for downstream use
     stitched_result = {"trajectories": stitched_trajectories}
@@ -683,8 +1158,20 @@ def main() -> None:
     with flat_path.open("w", encoding="utf-8") as f_flat:
         json.dump(output_payload, f_flat, indent=2)
 
+    # 3) discretised output sampled every sample_period_ms (default 20 ms)
+    sample_period_s = max(args.sample_period_ms / 1000.0, 1e-6)
+    discretised_payload = discretize_trajectories(stitched_trajectories, section_times, sample_period_s)
+    with discretised_path.open("w", encoding="utf-8") as f_disc:
+        json.dump(discretised_payload, f_disc, indent=2)
+
     if stitched_trajectories:
-        create_visualization_pdf(stitched_trajectories, section_times, str(pdf_path), already_stitched=True)
+        create_visualization_pdf(
+            stitched_trajectories,
+            section_times,
+            str(pdf_path),
+            already_stitched=True,
+            motion_profile=pdf_motion_profile,
+        )
         print(f"Saved trajectory visualizations to {pdf_path}")
 
     print(f"Outputs written to {run_output_dir}")
