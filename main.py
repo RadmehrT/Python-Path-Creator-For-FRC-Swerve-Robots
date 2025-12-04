@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 import math
 from pathlib import Path
@@ -818,6 +819,142 @@ def discretize_trajectories(
     }
 
 
+def _write_spliced_csv(trajectories: list[dict], csv_path: Path) -> None:
+    """
+    Emit stitched trajectories to CSV rows (trajectory, index, pose type, pose data).
+    """
+    fieldnames = [
+        "trajectory",
+        "point_index",
+        "point_type",
+        "x",
+        "y",
+        "heading",
+        "initialCurveIntensity",
+        "curveIntensity",
+        "b",
+    ]
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for traj_idx, traj in enumerate(trajectories, start=1):
+            curve_intensity = traj.get("curveIntensity")
+            initial_curve = traj.get("initialCurveIntensity")
+            point_idx = 0
+
+            def emit(point: dict, point_type: str, idx: int) -> None:
+                writer.writerow(
+                    {
+                        "trajectory": traj_idx,
+                        "point_index": idx,
+                        "point_type": point_type,
+                        "x": point.get("x"),
+                        "y": point.get("y"),
+                        "heading": point.get("heading", 0.0),
+                        "initialCurveIntensity": initial_curve,
+                        "curveIntensity": curve_intensity,
+                        "b": point.get("b"),
+                    }
+                )
+
+            start = traj.get("start")
+            if start:
+                emit(start, "start", point_idx)
+                point_idx += 1
+
+            for pose in traj.get("poses", []):
+                emit(pose, "pose", point_idx)
+                point_idx += 1
+
+            end = traj.get("end")
+            if end:
+                emit(end, "end", point_idx)
+
+
+def _write_flattened_csv(flat_payload: dict, csv_path: Path, times_csv_path: Path) -> None:
+    """
+    Convert the flattened payload (my_output.json) into CSVs.
+    """
+    trajectories = flat_payload.get("trajectories", {})
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["trajectory", "point_index", "x", "y", "heading"])
+        writer.writeheader()
+        if isinstance(trajectories, dict):
+            for traj_name, points in trajectories.items():
+                for idx, pt in enumerate(points):
+                    writer.writerow(
+                        {
+                            "trajectory": traj_name,
+                            "point_index": idx,
+                            "x": pt.get("x"),
+                            "y": pt.get("y"),
+                            "heading": pt.get("heading", 0.0),
+                        }
+                    )
+
+    times = flat_payload.get("times", {})
+    sections = times.get("sections", [])
+    with times_csv_path.open("w", newline="", encoding="utf-8") as f_times:
+        writer = csv.DictWriter(f_times, fieldnames=["section", "time"])
+        writer.writeheader()
+        if isinstance(sections, list):
+            for sec in sections:
+                writer.writerow({"section": sec.get("section"), "time": sec.get("time")})
+        if "total" in times:
+            writer.writerow({"section": "total", "time": times.get("total")})
+
+
+def _write_discretised_csv(discretised_payload: dict, csv_path: Path) -> None:
+    """
+    Convert discretised timeline samples into a CSV file.
+    """
+    samples = discretised_payload.get("samples", [])
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["time", "x", "y", "heading", "distance", "segment"]
+
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        if isinstance(samples, list):
+            for sample in samples:
+                writer.writerow(
+                    {
+                        "time": sample.get("time"),
+                        "x": sample.get("x"),
+                        "y": sample.get("y"),
+                        "heading": sample.get("heading"),
+                        "distance": sample.get("distance"),
+                        "segment": sample.get("segment"),
+                    }
+                )
+
+
+def write_output_csvs(
+    stitched_trajectories: list[dict],
+    flat_payload: dict,
+    discretised_payload: dict,
+    output_dir: Path,
+    flat_json_name: str,
+) -> None:
+    """
+    Write CSV siblings for the standard JSON outputs.
+    """
+    _write_spliced_csv(stitched_trajectories, output_dir / "myoutput_spliced.csv")
+
+    flat_stem = Path(flat_json_name).stem
+    _write_flattened_csv(
+        flat_payload,
+        output_dir / f"{flat_stem}.csv",
+        output_dir / f"{flat_stem}_times.csv",
+    )
+
+    _write_discretised_csv(discretised_payload, output_dir / "discretised_output.csv")
+
+
 def _next_output_dir(base_dir: Path) -> Path:
     """
     Find the next numbered subdirectory under base_dir named 'output N'.
@@ -1163,6 +1300,14 @@ def main() -> None:
     discretised_payload = discretize_trajectories(stitched_trajectories, section_times, sample_period_s)
     with discretised_path.open("w", encoding="utf-8") as f_disc:
         json.dump(discretised_payload, f_disc, indent=2)
+
+    write_output_csvs(
+        stitched_trajectories,
+        output_payload,
+        discretised_payload,
+        run_output_dir,
+        Path(args.output).name,
+    )
 
     if stitched_trajectories:
         create_visualization_pdf(

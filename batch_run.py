@@ -9,6 +9,7 @@ from main import (
     flatten_trajectories,
     generate_trajectories_from_config,
     stitch_trajectories_to_waypoints,
+    write_output_csvs,
 )
 from trapezoidMotionProfile import trapezoidMotionProfile
 
@@ -76,6 +77,14 @@ def process_csv(
     discretised_path = output_dir / "discretised_output.json"
     with discretised_path.open("w", encoding="utf-8") as f_disc:
         json.dump(discretised_payload, f_disc, indent=2)
+
+    write_output_csvs(
+        stitched_trajectories,
+        flat_payload,
+        discretised_payload,
+        output_dir,
+        flat_path.name,
+    )
 
     # Visualization PDF for this CSV (stitched geometry)
     if stitched_trajectories:
